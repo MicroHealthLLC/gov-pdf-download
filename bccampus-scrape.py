@@ -4,37 +4,92 @@ from pathlib import Path
 import re
 import aiohttp
 import aiofiles
+from urllib.parse import urlparse
 
-async def download_pdf(session, url, save_path, book_title):
+async def download_pdf(session, url, save_path, book_title, max_retries=3):
     """
-    Download PDF directly using aiohttp
+    Download PDF directly using aiohttp with retry logic
     """
-    try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        }
-        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=180)) as response:
-            if response.status == 200:
-                content = await response.read()
-                async with aiofiles.open(save_path, 'wb') as f:
-                    await f.write(content)
-                print(f"    ✓ Downloaded: {book_title}.pdf ({len(content) / 1024 / 1024:.2f} MB)")
-                return True
+    for attempt in range(max_retries):
+        try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'application/pdf,application/octet-stream,*/*',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Referer': 'https://collection.bccampus.ca/'
+            }
+            
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=180), allow_redirects=True) as response:
+                if response.status == 200:
+                    content = await response.read()
+                    
+                    # Verify it's actually a PDF
+                    if content[:4] == b'%PDF':
+                        async with aiofiles.open(save_path, 'wb') as f:
+                            await f.write(content)
+                        print(f"    ✓ Downloaded: {book_title}.pdf ({len(content) / 1024 / 1024:.2f} MB)")
+                        return True
+                    else:
+                        print(f"    ✗ Downloaded file is not a valid PDF: {book_title}")
+                        return False
+                        
+                elif response.status == 403:
+                    print(f"    ✗ Access denied (403 Forbidden): {book_title}")
+                    print(f"      URL: {url}")
+                    return False
+                    
+                elif response.status == 404:
+                    print(f"    ✗ File not found (404): {book_title}")
+                    return False
+                    
+                else:
+                    if attempt < max_retries - 1:
+                        print(f"    ⚠ Status {response.status}, retrying ({attempt + 1}/{max_retries})...")
+                        await asyncio.sleep(2 ** attempt)
+                        continue
+                    else:
+                        print(f"    ✗ Failed to download (Status {response.status}): {book_title}")
+                        return False
+                        
+        except asyncio.TimeoutError:
+            if attempt < max_retries - 1:
+                print(f"    ⚠ Timeout, retrying ({attempt + 1}/{max_retries})...")
+                await asyncio.sleep(2 ** attempt)
+                continue
             else:
-                print(f"    ✗ Failed to download (Status {response.status}): {book_title}")
+                print(f"    ✗ Timeout after {max_retries} attempts: {book_title}")
                 return False
-    except Exception as e:
-        print(f"    ✗ Error downloading {book_title}: {str(e)}")
-        return False
+                
+        except Exception as e:
+            if attempt < max_retries - 1:
+                print(f"    ⚠ Error: {str(e)}, retrying ({attempt + 1}/{max_retries})...")
+                await asyncio.sleep(2 ** attempt)
+                continue
+            else:
+                print(f"    ✗ Error downloading {book_title}: {str(e)}")
+                return False
+    
+    return False
 
 async def scrape_bccampus_pdfs():
     """
     Scrape PDFs from BC Campus Open Collection organized by subject
-    Two-step process: Extract book page URL, then extract actual PDF URL
+    Intercepts network requests to capture signed URLs with authentication parameters
     """
     base_url = "https://collection.bccampus.ca"
     download_dir = Path("bccampus_downloads")
     download_dir.mkdir(exist_ok=True)
+    
+    # Track statistics
+    stats = {
+        'total_books': 0,
+        'successful': 0,
+        'failed': 0,
+        'skipped': 0
+    }
+    
+    # Create error log file
+    error_log = download_dir / "download_errors.log"
     
     # Create aiohttp session for downloads
     connector = aiohttp.TCPConnector(limit=5)
@@ -59,7 +114,7 @@ async def scrape_bccampus_pdfs():
                 await browser.close()
                 return
             
-            # Extract all subject categories from the landing page
+            # Extract all subject categories
             subject_elements = await page.query_selector_all('a[href*="/concept/subject/"]')
             
             subject_data = []
@@ -69,7 +124,6 @@ async def scrape_bccampus_pdfs():
                     subject_link = await subject_elem.get_attribute('href')
                     
                     if subject_link and '/concept/subject/' in subject_link:
-                        # Clean subject name for folder creation
                         clean_name = re.sub(r'[<>:"/\\|?*]', '', subject_name.strip())
                         clean_name = re.sub(r'\d+\s+results?', '', clean_name).strip()
                         
@@ -79,7 +133,7 @@ async def scrape_bccampus_pdfs():
                                 'name': clean_name,
                                 'url': full_url
                             })
-                except Exception as e:
+                except Exception:
                     continue
             
             # Remove duplicates
@@ -96,16 +150,13 @@ async def scrape_bccampus_pdfs():
             for idx, subject in enumerate(unique_subjects, 1):
                 print(f"[{idx}/{len(unique_subjects)}] Processing subject: {subject['name']}")
                 
-                # Create subject folder
                 subject_folder = download_dir / subject['name']
                 subject_folder.mkdir(exist_ok=True)
                 
                 try:
-                    # Navigate to subject page
                     await page.goto(subject['url'], wait_until='domcontentloaded', timeout=60000)
                     await asyncio.sleep(2)
                     
-                    # Find all book links on the subject page
                     book_elements = await page.query_selector_all('a[href*="/textbook/"]')
                     
                     book_urls = []
@@ -117,62 +168,76 @@ async def scrape_bccampus_pdfs():
                                 book_urls.append(full_url)
                     
                     print(f"  Found {len(book_urls)} books")
+                    stats['total_books'] += len(book_urls)
                     
                     # Process each book
                     for book_idx, book_url in enumerate(book_urls, 1):
                         try:
                             print(f"  [{book_idx}/{len(book_urls)}] Processing: {book_url}")
                             
-                            # STEP 1: Navigate to book page
                             await page.goto(book_url, wait_until='domcontentloaded', timeout=60000)
                             await asyncio.sleep(2)
                             
-                            # Get book title for filename
+                            # Get book title
                             title_elem = await page.query_selector('h1')
                             book_title = await title_elem.inner_text() if title_elem else f"book_{book_idx}"
                             book_title = re.sub(r'[<>:"/\\|?*]', '', book_title.strip())[:100]
                             
-                            # STEP 2: Extract the ACTUAL PDF download URL from the page
-                            # Try multiple selectors to find the PDF link
+                            save_path = subject_folder / f"{book_title}.pdf"
+                            
+                            if save_path.exists():
+                                print(f"    ⊘ Already exists: {book_title}.pdf")
+                                stats['skipped'] += 1
+                                continue
+                            
+                            # Find PDF link
                             pdf_link = await page.query_selector('a[href*="download?type=pdf"], a[href$=".pdf"], a:has-text("PDF (.pdf)"), a:has-text("PDF"), button:has-text("PDF")')
                             
                             if pdf_link:
-                                # Get the actual PDF URL
-                                pdf_url = await pdf_link.get_attribute('href')
+                                # CAPTURE THE ACTUAL DOWNLOAD URL BY INTERCEPTING THE REQUEST
+                                captured_url = None
                                 
-                                if pdf_url:
-                                    # Make absolute URL if needed
-                                    if not pdf_url.startswith('http'):
-                                        # Check if it's a relative URL from the book page domain
-                                        if pdf_url.startswith('/'):
-                                            # Extract base domain from book page
-                                            current_url = page.url
-                                            from urllib.parse import urlparse
-                                            parsed = urlparse(current_url)
-                                            pdf_url = f"{parsed.scheme}://{parsed.netloc}{pdf_url}"
-                                        else:
-                                            pdf_url = base_url + pdf_url
+                                async def capture_request(request):
+                                    nonlocal captured_url
+                                    # Capture PDF download requests
+                                    if '.pdf' in request.url or 'download?type=pdf' in request.url:
+                                        captured_url = request.url
+                                
+                                # Set up request interception
+                                page.on("request", capture_request)
+                                
+                                # Click the link to trigger the download request
+                                try:
+                                    await pdf_link.click(timeout=5000)
+                                    await asyncio.sleep(2)  # Wait for request to be captured
+                                except Exception:
+                                    pass  # Click might fail but request should still be captured
+                                
+                                # Remove the listener
+                                page.remove_listener("request", capture_request)
+                                
+                                if captured_url:
+                                    print(f"    Found PDF URL: {captured_url}")
                                     
-                                    print(f"    Found PDF URL: {pdf_url}")
-                                    
-                                    # Download the PDF
-                                    save_path = subject_folder / f"{book_title}.pdf"
-                                    
-                                    # Skip if already downloaded
-                                    if save_path.exists():
-                                        print(f"    ⊘ Already exists: {book_title}.pdf")
+                                    success = await download_pdf(http_session, captured_url, save_path, book_title)
+                                    if success:
+                                        stats['successful'] += 1
                                     else:
-                                        await download_pdf(http_session, pdf_url, save_path, book_title)
+                                        stats['failed'] += 1
+                                        async with aiofiles.open(error_log, 'a') as f:
+                                            await f.write(f"{book_title}|{book_url}|{captured_url}\n")
                                 else:
-                                    print(f"    ✗ No PDF URL attribute found for: {book_title}")
+                                    print(f"    ✗ Could not capture PDF URL for: {book_title}")
+                                    stats['failed'] += 1
                             else:
                                 print(f"    ✗ No PDF link element found for: {book_title}")
+                                stats['failed'] += 1
                             
-                            # Respectful delay
                             await asyncio.sleep(2)
                             
                         except Exception as e:
                             print(f"    ✗ Error processing book: {str(e)}")
+                            stats['failed'] += 1
                             continue
                             
                 except Exception as e:
@@ -180,11 +245,19 @@ async def scrape_bccampus_pdfs():
                     continue
             
             await browser.close()
-            print("\n✓ Scraping complete!")
+            
+            # Print summary
+            print("\n" + "=" * 50)
+            print("✓ Scraping complete!")
             print(f"Files saved to: {download_dir.absolute()}")
+            print(f"\nStatistics:")
+            print(f"  Total books found: {stats['total_books']}")
+            print(f"  Successfully downloaded: {stats['successful']}")
+            print(f"  Failed downloads: {stats['failed']}")
+            print(f"  Already existed (skipped): {stats['skipped']}")
+            print(f"\nFailed downloads logged to: {error_log}")
 
-# Run the scraper
 if __name__ == "__main__":
-    print("BC Campus PDF Scraper - Two-Step URL Extraction")
+    print("BC Campus PDF Scraper - Network Request Interception")
     print("=" * 50)
     asyncio.run(scrape_bccampus_pdfs())
