@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 from typing import List, Dict, Any
 import openpyxl
+import numpy as np
 
 def print_banner():
     """Display application banner"""
@@ -56,12 +57,82 @@ def detect_excel_sheets(file_path: str) -> List[str]:
         print(f"Warning: Could not read sheets from {file_path}: {e}")
         return []
 
+def clean_dataframe(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
+    """
+    Clean dataframe by removing unnamed and empty columns
+    
+    Args:
+        df: Input dataframe
+        verbose: Print cleaning information
+    
+    Returns:
+        Cleaned dataframe
+    """
+    original_cols = len(df.columns)
+    
+    # Step 1: Remove columns that are entirely unnamed and empty
+    columns_to_keep = []
+    columns_removed = []
+    
+    for col in df.columns:
+        # Check if column name starts with "Unnamed:"
+        is_unnamed = str(col).startswith('Unnamed:')
+        
+        # Check if column is entirely null/empty
+        is_empty = df[col].isna().all() or (df[col].astype(str).str.strip() == '').all()
+        
+        # Calculate percentage of non-null values
+        non_null_pct = (df[col].notna().sum() / len(df)) * 100
+        
+        # Keep column if:
+        # 1. It's not unnamed, OR
+        # 2. It's unnamed but has significant data (>5% non-null)
+        if not is_unnamed or (is_unnamed and non_null_pct > 5):
+            columns_to_keep.append(col)
+        else:
+            columns_removed.append({
+                'name': col,
+                'non_null_pct': non_null_pct,
+                'reason': 'Unnamed and mostly empty'
+            })
+    
+    # Create cleaned dataframe
+    df_cleaned = df[columns_to_keep].copy()
+    
+    # Step 2: Remove rows that are entirely empty
+    rows_before = len(df_cleaned)
+    df_cleaned = df_cleaned.dropna(how='all')
+    rows_removed = rows_before - len(df_cleaned)
+    
+    if verbose and (columns_removed or rows_removed > 0):
+        print(f"\n{'='*70}")
+        print("DATA CLEANING SUMMARY")
+        print(f"{'='*70}")
+        print(f"Original columns: {original_cols}")
+        print(f"Columns removed: {len(columns_removed)}")
+        print(f"Columns retained: {len(columns_to_keep)}")
+        print(f"Empty rows removed: {rows_removed}")
+        
+        if columns_removed:
+            print(f"\nRemoved columns:")
+            for col_info in columns_removed:
+                print(f"  - {col_info['name']} ({col_info['non_null_pct']:.1f}% data)")
+        
+        print(f"\nRetained columns:")
+        for col in df_cleaned.columns:
+            non_null_pct = (df_cleaned[col].notna().sum() / len(df_cleaned)) * 100
+            print(f"  - {col} ({non_null_pct:.1f}% data)")
+        print(f"{'='*70}\n")
+    
+    return df_cleaned
+
 def convert_to_contextual_json(
     file_path: str,
     output_prefix: str,
     max_size_mb: float,
     sheet_name: str = None,
-    include_metadata: bool = True
+    include_metadata: bool = True,
+    clean_data: bool = True
 ):
     """
     Convert CSV/Excel to JSON with preserved row and column context
@@ -72,6 +143,7 @@ def convert_to_contextual_json(
         max_size_mb: Maximum size per segment in MB
         sheet_name: Excel sheet name (None for CSV)
         include_metadata: Include file metadata in output
+        clean_data: Remove unnamed/empty columns
     """
     print(f"\n{'='*70}")
     print(f"Processing: {file_path}")
@@ -91,6 +163,18 @@ def convert_to_contextual_json(
         print(f"Error reading file: {e}")
         return
     
+    # Clean the dataframe if requested
+    if clean_data:
+        df = clean_dataframe(df, verbose=True)
+        
+        if len(df.columns) == 0:
+            print("Warning: No valid columns remaining after cleaning. Skipping file.")
+            return
+        
+        if len(df) == 0:
+            print("Warning: No valid rows remaining after cleaning. Skipping file.")
+            return
+    
     # Calculate max size in bytes
     max_size_bytes = max_size_mb * 1024 * 1024
     
@@ -105,7 +189,8 @@ def convert_to_contextual_json(
         "source_identifier": source_identifier,
         "total_rows_in_source": total_rows,
         "column_count": len(df.columns),
-        "data_types": {col: str(df[col].dtype) for col in df.columns}
+        "data_types": {col: str(df[col].dtype) for col in df.columns},
+        "data_cleaned": clean_data
     } if include_metadata else {}
     
     print(f"Total rows to process: {total_rows}")
@@ -129,6 +214,8 @@ def convert_to_contextual_json(
                 cell_value = None
             elif isinstance(cell_value, (pd.Timestamp, pd.Timedelta)):
                 cell_value = str(cell_value)
+            elif isinstance(cell_value, (np.integer, np.floating)):
+                cell_value = cell_value.item()  # Convert numpy types to Python types
             
             row_object["row_data"][column] = {
                 "column_name": column,
@@ -208,7 +295,7 @@ def write_segment(
     file_size = os.path.getsize(output_file) / (1024 * 1024)
     print(f"✓ Created: {output_file} ({file_size:.2f} MB)")
 
-def process_file(file_path: str, output_dir: str, max_size_mb: float):
+def process_file(file_path: str, output_dir: str, max_size_mb: float, clean_data: bool):
     """Process a single file (CSV or Excel with multiple tabs)"""
     file_name = Path(file_path).stem
     
@@ -240,11 +327,11 @@ def process_file(file_path: str, output_dir: str, max_size_mb: float):
         for sheet in sheets_to_process:
             safe_sheet_name = sheet.replace(' ', '_').replace('/', '_')
             output_prefix = os.path.join(output_dir, f"{file_name}_{safe_sheet_name}")
-            convert_to_contextual_json(file_path, output_prefix, max_size_mb, sheet)
+            convert_to_contextual_json(file_path, output_prefix, max_size_mb, sheet, clean_data=clean_data)
     else:
         # Process as CSV
         output_prefix = os.path.join(output_dir, file_name)
-        convert_to_contextual_json(file_path, output_prefix, max_size_mb)
+        convert_to_contextual_json(file_path, output_prefix, max_size_mb, clean_data=clean_data)
 
 def main():
     """Main interactive CLI function"""
@@ -301,13 +388,27 @@ def main():
         min_val=0.1
     )
     
-    # Step 4: Process files
-    print("\nSTEP 4: Processing Files")
+    # Step 4: Data cleaning option
+    print("\nSTEP 4: Data Cleaning Configuration")
+    print("-" * 70)
+    clean_choice = get_user_input(
+        "Automatically remove unnamed/empty columns? (Y/N)",
+        "Y"
+    ).upper()
+    clean_data = clean_choice == 'Y'
+    
+    if clean_data:
+        print("✓ Will automatically clean unnamed and empty columns")
+    else:
+        print("✓ Will preserve all columns as-is")
+    
+    # Step 5: Process files
+    print("\nSTEP 5: Processing Files")
     print("-" * 70)
     
     for file_path in files_to_process:
         try:
-            process_file(file_path, output_dir, max_size_mb)
+            process_file(file_path, output_dir, max_size_mb, clean_data)
         except Exception as e:
             print(f"Error processing {file_path}: {e}")
             import traceback
@@ -323,6 +424,7 @@ def main():
     print("  • Data type information for semantic understanding")
     print("  • Multi-tab support with sheet identification")
     print("  • Configurable segment sizes for optimal chunking")
+    print("  • Automatic removal of unnamed/empty columns (if enabled)")
 
 if __name__ == "__main__":
     try:
