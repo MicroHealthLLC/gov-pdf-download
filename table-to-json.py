@@ -115,13 +115,17 @@ def clean_dataframe(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
         
         if columns_removed:
             print(f"\nRemoved columns:")
-            for col_info in columns_removed:
+            for col_info in columns_removed[:10]:  # Limit to first 10
                 print(f"  - {col_info['name']} ({col_info['non_null_pct']:.1f}% data)")
+            if len(columns_removed) > 10:
+                print(f"  ... and {len(columns_removed) - 10} more")
         
         print(f"\nRetained columns:")
-        for col in df_cleaned.columns:
+        for col in df_cleaned.columns[:10]:  # Limit to first 10
             non_null_pct = (df_cleaned[col].notna().sum() / len(df_cleaned)) * 100
             print(f"  - {col} ({non_null_pct:.1f}% data)")
+        if len(df_cleaned.columns) > 10:
+            print(f"  ... and {len(df_cleaned.columns) - 10} more")
         print(f"{'='*70}\n")
     
     return df_cleaned
@@ -132,7 +136,8 @@ def convert_to_contextual_json(
     max_size_mb: float,
     sheet_name: str = None,
     include_metadata: bool = True,
-    clean_data: bool = True
+    clean_data: bool = True,
+    minify: bool = True
 ):
     """
     Convert CSV/Excel to JSON with preserved row and column context
@@ -144,6 +149,7 @@ def convert_to_contextual_json(
         sheet_name: Excel sheet name (None for CSV)
         include_metadata: Include file metadata in output
         clean_data: Remove unnamed/empty columns
+        minify: Save JSON in minified format (no whitespace)
     """
     print(f"\n{'='*70}")
     print(f"Processing: {file_path}")
@@ -190,12 +196,14 @@ def convert_to_contextual_json(
         "total_rows_in_source": total_rows,
         "column_count": len(df.columns),
         "data_types": {col: str(df[col].dtype) for col in df.columns},
-        "data_cleaned": clean_data
+        "data_cleaned": clean_data,
+        "minified": minify
     } if include_metadata else {}
     
     print(f"Total rows to process: {total_rows}")
     print(f"Columns: {len(df.columns)}")
-    print(f"Target segment size: {max_size_mb} MB\n")
+    print(f"Target segment size: {max_size_mb} MB")
+    print(f"Output format: {'Minified' if minify else 'Formatted'}\n")
     
     for index, row in df.iterrows():
         # Create a rich context object for each row
@@ -224,8 +232,8 @@ def convert_to_contextual_json(
                 "original_dtype": str(df[column].dtype)
             }
         
-        # Convert to JSON string to check size
-        row_json = json.dumps(row_object, ensure_ascii=False, default=str)
+        # Convert to JSON string to check size (using minified format for size calculation)
+        row_json = json.dumps(row_object, ensure_ascii=False, separators=(',', ':'), default=str)
         row_size = len(row_json.encode('utf-8'))
         
         # Check if adding this row exceeds segment size
@@ -237,7 +245,8 @@ def convert_to_contextual_json(
                 current_segment,
                 df.columns.tolist(),
                 metadata,
-                source_identifier
+                source_identifier,
+                minify
             )
             
             # Reset for next segment
@@ -260,7 +269,8 @@ def convert_to_contextual_json(
             current_segment,
             df.columns.tolist(),
             metadata,
-            source_identifier
+            source_identifier,
+            minify
         )
     
     print(f"\n✓ Completed processing {total_rows} rows into {segment_num} segment(s)\n")
@@ -271,9 +281,21 @@ def write_segment(
     segment_data: List[Dict],
     column_schema: List[str],
     metadata: Dict[str, Any],
-    source_identifier: str
+    source_identifier: str,
+    minify: bool = True
 ):
-    """Write a segment to JSON file"""
+    """
+    Write a segment to JSON file
+    
+    Args:
+        output_prefix: Prefix for output filename
+        segment_num: Segment number
+        segment_data: List of row objects
+        column_schema: List of column names
+        metadata: File metadata
+        source_identifier: Source file identifier
+        minify: If True, save in minified format; if False, use pretty-print
+    """
     output_file = f"{output_prefix}_segment_{segment_num}.json"
     
     segment_content = {
@@ -290,12 +312,17 @@ def write_segment(
     }
     
     with open(output_file, 'w', encoding='utf-8') as f:
-        json.dump(segment_content, f, indent=2, ensure_ascii=False, default=str)
+        if minify:
+            # Minified format: no whitespace, compact separators
+            json.dump(segment_content, f, ensure_ascii=False, separators=(',', ':'), default=str)
+        else:
+            # Pretty-print format: indented, readable
+            json.dump(segment_content, f, indent=2, ensure_ascii=False, default=str)
     
     file_size = os.path.getsize(output_file) / (1024 * 1024)
     print(f"✓ Created: {output_file} ({file_size:.2f} MB)")
 
-def process_file(file_path: str, output_dir: str, max_size_mb: float, clean_data: bool):
+def process_file(file_path: str, output_dir: str, max_size_mb: float, clean_data: bool, minify: bool):
     """Process a single file (CSV or Excel with multiple tabs)"""
     file_name = Path(file_path).stem
     
@@ -327,11 +354,11 @@ def process_file(file_path: str, output_dir: str, max_size_mb: float, clean_data
         for sheet in sheets_to_process:
             safe_sheet_name = sheet.replace(' ', '_').replace('/', '_')
             output_prefix = os.path.join(output_dir, f"{file_name}_{safe_sheet_name}")
-            convert_to_contextual_json(file_path, output_prefix, max_size_mb, sheet, clean_data=clean_data)
+            convert_to_contextual_json(file_path, output_prefix, max_size_mb, sheet, clean_data=clean_data, minify=minify)
     else:
         # Process as CSV
         output_prefix = os.path.join(output_dir, file_name)
-        convert_to_contextual_json(file_path, output_prefix, max_size_mb, clean_data=clean_data)
+        convert_to_contextual_json(file_path, output_prefix, max_size_mb, clean_data=clean_data, minify=minify)
 
 def main():
     """Main interactive CLI function"""
@@ -402,29 +429,66 @@ def main():
     else:
         print("✓ Will preserve all columns as-is")
     
-    # Step 5: Process files
-    print("\nSTEP 5: Processing Files")
+    # Step 5: JSON format option
+    print("\nSTEP 5: JSON Format Configuration")
+    print("-" * 70)
+    print("Minified JSON removes all whitespace and indentation,")
+    print("reducing file size by 30-50% but making it less human-readable.")
+    minify_choice = get_user_input(
+        "Save JSON in minified format? (Y/N)",
+        "Y"
+    ).upper()
+    minify = minify_choice == 'Y'
+    
+    if minify:
+        print("✓ Will save JSON in minified format (compact, smaller files)")
+    else:
+        print("✓ Will save JSON in formatted format (readable, larger files)")
+    
+    # Step 6: Process files
+    print("\nSTEP 6: Processing Files")
     print("-" * 70)
     
-    for file_path in files_to_process:
+    total_files = len(files_to_process)
+    for idx, file_path in enumerate(files_to_process, 1):
+        print(f"\n[File {idx}/{total_files}]")
         try:
-            process_file(file_path, output_dir, max_size_mb, clean_data)
+            process_file(file_path, output_dir, max_size_mb, clean_data, minify)
         except Exception as e:
             print(f"Error processing {file_path}: {e}")
             import traceback
             traceback.print_exc()
     
+    # Calculate total output size
+    total_size = 0
+    output_files = list(Path(output_dir).glob("*.json"))
+    for f in output_files:
+        total_size += f.stat().st_size
+    
+    total_size_mb = total_size / (1024 * 1024)
+    
     print("\n" + "=" * 70)
     print("  ✓ CONVERSION COMPLETE")
     print("=" * 70)
-    print(f"\nOutput files saved to: {output_dir}")
+    print(f"\nOutput directory: {output_dir}")
+    print(f"Total files created: {len(output_files)}")
+    print(f"Total output size: {total_size_mb:.2f} MB")
+    
+    if minify:
+        estimated_unminified = total_size_mb * 1.5  # Approximate 50% larger
+        print(f"Estimated size if unminified: ~{estimated_unminified:.2f} MB")
+        print(f"Space saved by minification: ~{estimated_unminified - total_size_mb:.2f} MB")
+    
     print("\nThese JSON files are optimized for LLM vectorization with:")
     print("  • Preserved row and column context")
     print("  • Embedded column names with each value")
     print("  • Data type information for semantic understanding")
     print("  • Multi-tab support with sheet identification")
     print("  • Configurable segment sizes for optimal chunking")
-    print("  • Automatic removal of unnamed/empty columns (if enabled)")
+    if clean_data:
+        print("  • Automatic removal of unnamed/empty columns")
+    if minify:
+        print("  • Minified format for reduced file size")
 
 if __name__ == "__main__":
     try:
