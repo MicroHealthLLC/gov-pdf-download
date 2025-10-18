@@ -12,15 +12,27 @@ class GAOReportScraper:
         self.output_folder.mkdir(exist_ok=True)
         self.base_url = "https://www.gao.gov"
         
-    def build_gao_url(self, start_date_str, page_num=0):
-        """Build GAO URL with dynamic date range and pagination"""
+    def build_gao_url(self, start_date_str, end_date_str, page_num=0):
+        """
+        Build GAO URL with dynamic start and end date range and pagination
+        
+        Args:
+            start_date_str: Start date in YYYY-MM-DD format
+            end_date_str: End date in YYYY-MM-DD format
+            page_num: Page number for pagination (0-indexed)
+        
+        Returns:
+            Tuple of (url, start_date, end_date)
+        """
         try:
             start_date = datetime.strptime(start_date_str, "%Y-%m-%d")
-            end_date = datetime.now()
+            end_date = datetime.strptime(end_date_str, "%Y-%m-%d")
             
+            # Convert to timestamps (end of day for both dates)
             start_timestamp = int(start_date.replace(hour=23, minute=59, second=59).timestamp())
             end_timestamp = int(end_date.replace(hour=23, minute=59, second=59).timestamp())
             
+            # Build URL with date range
             url = (
                 f"{self.base_url}/reports-testimonies?"
                 f"f%5B0%5D=rt_date_range_gui%3A%28min%3A{start_timestamp}%2Cmax%3A{end_timestamp}%29"
@@ -43,212 +55,47 @@ class GAOReportScraper:
         except:
             return False
     
-    async def download_pdf_properly(self, page, pdf_url, filename):
+    async def download_pdf_with_playwright_api(self, context, pdf_url, filepath, filename):
         """
-        Download PDFs using fetch API - avoids timeout with expect_download()
+        Download PDF using Playwright's API request
+        This uses the browser's context to avoid 403 errors
         """
+        print(f"  Downloading PDF with Playwright API: {pdf_url}")
+        
         try:
-            filepath = self.output_folder / filename
+            response = await context.request.get(pdf_url)
             
-            print(f"  Downloading PDF: {pdf_url}")
-            
-            # Method 1: Use fetch API (BEST for direct PDF URLs)
-            # This avoids the timeout issue with expect_download()
-            try:
-                return await self.download_via_fetch(page, pdf_url, filepath, filename)
-            except Exception as e:
-                print(f"  Fetch method failed: {str(e)}")
-            
-            # Method 2: Use route interception
-            try:
-                return await self.download_with_route(page, pdf_url, filepath, filename)
-            except Exception as e2:
-                print(f"  Route method failed: {str(e2)}")
-            
-            # Method 3: Navigate and extract from response
-            try:
-                return await self.download_via_response(page, pdf_url, filepath, filename)
-            except Exception as e3:
-                print(f"  Response method failed: {str(e3)}")
+            if response.status == 200:
+                pdf_content = await response.body()
                 
-            return False
-            
-        except Exception as e:
-            print(f"✗ Unexpected error: {str(e)}")
-            return False
-    
-    async def download_via_fetch(self, page, pdf_url, filepath, filename):
-        """
-        Use browser's fetch API to download PDF - MOST RELIABLE METHOD
-        This executes in the browser context and avoids download event issues
-        """
-        print(f"  Trying fetch method...")
-        
-        try:
-            # Execute fetch in browser context to get PDF data
-            result = await page.evaluate("""
-                async (url) => {
-                    try {
-                        const response = await fetch(url, {
-                            method: 'GET',
-                            credentials: 'include',
-                            headers: {
-                                'Accept': 'application/pdf'
-                            }
-                        });
-                        
-                        if (!response.ok) {
-                            return {
-                                success: false,
-                                error: `HTTP ${response.status}: ${response.statusText}`
-                            };
-                        }
-                        
-                        const blob = await response.blob();
-                        const buffer = await blob.arrayBuffer();
-                        const bytes = Array.from(new Uint8Array(buffer));
-                        
-                        return {
-                            success: true,
-                            data: bytes,
-                            size: bytes.length
-                        };
-                    } catch (error) {
-                        return {
-                            success: false,
-                            error: error.message
-                        };
-                    }
-                }
-            """, pdf_url)
-            
-            if not result['success']:
-                print(f"  Fetch failed: {result.get('error', 'Unknown error')}")
-                return False
-            
-            # Convert to bytes and save
-            pdf_bytes = bytes(result['data'])
-            
-            with open(filepath, 'wb') as f:
-                f.write(pdf_bytes)
-            
-            # Verify it's a valid PDF
-            if self.is_valid_pdf(filepath):
-                file_size = filepath.stat().st_size
-                if file_size > 1000:
-                    print(f"✓ Downloaded via fetch: {filename} ({file_size:,} bytes)")
-                    return True
-            
-            print(f"  Invalid PDF or too small")
-            if filepath.exists():
-                filepath.unlink()
-            return False
-            
-        except Exception as e:
-            print(f"  Exception in fetch: {str(e)}")
-            return False
-    
-    async def download_with_route(self, page, pdf_url, filepath, filename):
-        """
-        Intercept the request and save the response body directly
-        """
-        print(f"  Trying route interception method...")
-        
-        try:
-            downloaded = False
-            download_error = None
-            
-            async def handle_route(route):
-                nonlocal downloaded, download_error
-                try:
-                    response = await route.fetch()
-                    
-                    # Get the body
-                    body = await response.body()
-                    
-                    # Save it
-                    with open(filepath, 'wb') as f:
-                        f.write(body)
-                    
-                    downloaded = True
-                    
-                    # Continue the route
-                    await route.fulfill(response=response)
-                    
-                except Exception as e:
-                    download_error = str(e)
-                    await route.abort()
-            
-            # Set up route handler
-            await page.route(pdf_url, handle_route)
-            
-            # Navigate to trigger the route
-            try:
-                await page.goto(pdf_url, wait_until='commit', timeout=30000)
-            except:
-                pass  # Navigation might fail but route should have captured it
-            
-            # Wait a bit for the route to complete
-            await asyncio.sleep(2)
-            
-            # Remove route
-            await page.unroute(pdf_url)
-            
-            if download_error:
-                print(f"  Route error: {download_error}")
-                return False
-            
-            if downloaded and filepath.exists() and self.is_valid_pdf(filepath):
-                file_size = filepath.stat().st_size
-                if file_size > 1000:
-                    print(f"✓ Downloaded via route: {filename} ({file_size:,} bytes)")
-                    return True
-            
-            return False
-            
-        except Exception as e:
-            print(f"  Route method exception: {str(e)}")
-            return False
-    
-    async def download_via_response(self, page, pdf_url, filepath, filename):
-        """
-        Navigate and capture response directly
-        """
-        print(f"  Trying response capture method...")
-        
-        try:
-            response_data = None
-            
-            async def handle_response(response):
-                nonlocal response_data
-                if pdf_url in response.url:
-                    try:
-                        response_data = await response.body()
-                    except:
-                        pass
-            
-            page.on('response', handle_response)
-            
-            await page.goto(pdf_url, wait_until='commit', timeout=30000)
-            await asyncio.sleep(2)
-            
-            page.remove_listener('response', handle_response)
-            
-            if response_data:
                 with open(filepath, 'wb') as f:
-                    f.write(response_data)
+                    f.write(pdf_content)
                 
                 if self.is_valid_pdf(filepath):
                     file_size = filepath.stat().st_size
                     if file_size > 1000:
-                        print(f"✓ Downloaded via response: {filename} ({file_size:,} bytes)")
+                        print(f"✓ Downloaded via Playwright API: {filename} ({file_size:,} bytes)")
                         return True
-            
-            return False
-            
+                
+                print(f"  Invalid PDF or too small")
+                if filepath.exists():
+                    filepath.unlink()
+                return False
+            else:
+                print(f"  HTTP {response.status}: {response.status_text}")
+                return False
+                
         except Exception as e:
-            print(f"  Response method exception: {str(e)}")
+            print(f"  Playwright API exception: {str(e)}")
             return False
+    
+    async def download_pdf_properly(self, context, pdf_url, filename):
+        """Download PDFs using Playwright's request API"""
+        filepath = self.output_folder / filename
+        
+        print(f"  Downloading PDF: {pdf_url}")
+        
+        return await self.download_pdf_with_playwright_api(context, pdf_url, filepath, filename)
     
     async def get_pdf_url_from_report_page(self, page, report_url):
         """Extract the PDF URL from a report page"""
@@ -301,11 +148,10 @@ class GAOReportScraper:
             print(f"Could not determine total pages: {str(e)}")
             return 0
     
-    async def scrape_reports(self, start_date_str):
-        """Main scraping function with pagination support"""
+    async def scrape_reports(self, start_date_str, end_date_str):
+        """Main scraping function with start and end date support"""
         
         async with async_playwright() as p:
-            # Launch browser with anti-detection settings
             browser = await p.chromium.launch(
                 headless=False,
                 args=[
@@ -316,7 +162,6 @@ class GAOReportScraper:
                 ]
             )
             
-            # Create context with proper configuration
             context = await browser.new_context(
                 user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                 viewport={'width': 1920, 'height': 1080},
@@ -331,29 +176,23 @@ class GAOReportScraper:
                 }
             )
             
-            # Add stealth modifications
             await context.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', {
                     get: () => undefined
                 });
-                
-                const originalQuery = window.navigator.permissions.query;
-                window.navigator.permissions.query = (parameters) => (
-                    parameters.name === 'notifications' ?
-                        Promise.resolve({ state: Notification.permission }) :
-                        originalQuery(parameters)
-                );
             """)
             
             page = await context.new_page()
             
-            listing_url, start_date, end_date = self.build_gao_url(start_date_str, 0)
+            listing_url, start_date, end_date = self.build_gao_url(start_date_str, end_date_str, 0)
             
             print(f"\n{'='*70}")
-            print(f"GAO Report Scraper")
+            print(f"GAO Report Scraper - Date Range Support")
             print(f"{'='*70}")
-            print(f"Date Range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
-            print(f"Output Folder: {self.output_folder.absolute()}")
+            print(f"Start Date:      {start_date.strftime('%Y-%m-%d')}")
+            print(f"End Date:        {end_date.strftime('%Y-%m-%d')}")
+            print(f"Output Folder:   {self.output_folder.absolute()}")
+            print(f"Method:          Playwright Request API")
             print(f"{'='*70}\n")
             
             try:
@@ -381,7 +220,7 @@ class GAOReportScraper:
             skipped = 0
             
             for page_num in range(total_pages + 1):
-                listing_url, _, _ = self.build_gao_url(start_date_str, page_num)
+                listing_url, _, _ = self.build_gao_url(start_date_str, end_date_str, page_num)
                 
                 print(f"{'='*70}")
                 print(f"Scraping Page {page_num + 1} of {total_pages + 1}")
@@ -441,7 +280,7 @@ class GAOReportScraper:
                         pdf_url = await self.get_pdf_url_from_report_page(page, report_url)
                         
                         if pdf_url:
-                            success = await self.download_pdf_properly(page, pdf_url, filename)
+                            success = await self.download_pdf_properly(context, pdf_url, filename)
                             if success:
                                 downloaded += 1
                             else:
@@ -451,7 +290,6 @@ class GAOReportScraper:
                             failed += 1
                         
                         print()
-                        # Random delay between downloads to avoid rate limiting
                         await asyncio.sleep(random.uniform(2, 5))
                     
                 except Exception as e:
@@ -472,45 +310,66 @@ class GAOReportScraper:
             print(f"Files saved to:  {self.output_folder.absolute()}")
             print(f"{'='*70}\n")
 
-def get_start_date_from_user():
-    """Prompt user for start date with validation"""
-    print("\n" + "="*70)
-    print("GAO Report Scraper - Interactive Mode")
-    print("="*70)
-    print("\nThis tool will download all GAO reports from your specified")
-    print("start date through today.\n")
+def get_date_from_user(prompt_text):
+    """
+    Prompt user for a date with validation
     
+    Args:
+        prompt_text: The prompt to display to the user
+    
+    Returns:
+        Date string in YYYY-MM-DD format
+    """
     while True:
-        start_date_input = input("Enter start date (YYYY-MM-DD, e.g., 2024-10-17): ").strip()
+        date_input = input(prompt_text).strip()
         
         date_pattern = r'^\d{4}-\d{2}-\d{2}$'
-        if not re.match(date_pattern, start_date_input):
+        if not re.match(date_pattern, date_input):
             print("❌ Invalid format. Please use YYYY-MM-DD format (e.g., 2024-10-17)\n")
             continue
         
         try:
-            start_date = datetime.strptime(start_date_input, "%Y-%m-%d")
+            parsed_date = datetime.strptime(date_input, "%Y-%m-%d")
             
-            if start_date > datetime.now():
-                print("❌ Start date cannot be in the future. Please enter a valid date.\n")
+            if parsed_date > datetime.now():
+                print("❌ Date cannot be in the future. Please enter a valid date.\n")
                 continue
             
-            return start_date_input
+            return date_input
             
         except ValueError:
             print("❌ Invalid date. Please enter a valid date (e.g., 2024-10-17)\n")
 
 def main():
-    start_date_str = get_start_date_from_user()
-    end_date_str = datetime.now().strftime("%Y-%m-%d")
-    output_folder = f"GAO-{start_date_str}-{end_date_str}"
+    """Main function with start and end date input"""
+    print("\n" + "="*70)
+    print("GAO Report Scraper - Date Range Mode")
+    print("="*70)
+    print("\nThis tool will download all GAO reports within your specified")
+    print("date range (start date to end date).\n")
+    
+    # Get start date
+    start_date_str = get_date_from_user("Enter START date (YYYY-MM-DD, e.g., 2024-10-17): ")
+    
+    # Get end date
+    end_date_str = get_date_from_user("Enter END date (YYYY-MM-DD, e.g., 2024-11-17): ")
+    
+    # Validate that start date is before or equal to end date
+    start_date = datetime.strptime(start_date_str, "%Y-%m-%d")
+    end_date = datetime.strptime(end_date_str, "%Y-%m-%d")
+    
+    if start_date > end_date:
+        print("\n❌ ERROR: Start date must be before or equal to end date.")
+        return
+    
+    output_folder = f"GAO-{start_date_str}-to-{end_date_str}"
     
     print(f"\n✓ Start date set to: {start_date_str}")
-    print(f"✓ End date (today): {end_date_str}")
+    print(f"✓ End date set to: {end_date_str}")
     print(f"✓ Output folder: {output_folder}\n")
     
     scraper = GAOReportScraper(output_folder=output_folder)
-    asyncio.run(scraper.scrape_reports(start_date_str))
+    asyncio.run(scraper.scrape_reports(start_date_str, end_date_str))
 
 if __name__ == "__main__":
     main()
